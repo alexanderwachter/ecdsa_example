@@ -20,9 +20,12 @@ int create_keys(char** pub_hex, char** priv_hex);
 int bytes_to_hex(unsigned char* bytes, int der_len, char** hex_str);
 int hex_to_bytes(char* hex, unsigned char** bytes);
 int verify_signature(unsigned char* hash, char* signature, char* pub_key);
-int sign(unsigned char* hash, char* priv_hex, char** sig_hex);
+int sign(unsigned char* hash, BIGNUM *priv, ECDSA_SIG** signature);
+int sign_hex(unsigned char* hash, char* priv_hex, char** sig_hex);
+int sig_to_hex(ECDSA_SIG* sig, int key_size, char** sig_hex);
 int hash_mycert(myCert* cert, unsigned char** hash);
-int sign_mycert(myCert* cert, char* private_key);
+int sign_mycert_hex(myCert* cert, char* private_key);
+int sign_mycert_file(myCert* cert, char* private_key);
 int verify_mycert(myCert* cert, char* pub_key);
 int create_new_cert(const char* owner, myCert** cert);
 void print_mycert(myCert* cert);
@@ -36,7 +39,7 @@ int main(int argc, char* argv[])
 
   create_keys(&pub_key, &priv_key);
   printf("Public key : %s\nPrivate key: %s\n", pub_key, priv_key);
-  sign((unsigned char*)"this is the second hash", priv_key, &sig);
+  sign_hex((unsigned char*)"this is the second hash", priv_key, &sig);
   printf("Signature: %s\n", sig);
   verify_res = verify_signature((unsigned char*)"this is the second hash", sig, pub_key);
   printf("Verification result: %s\n", verify_res ? "SUCCESS" : "FAIL");
@@ -45,7 +48,7 @@ int main(int argc, char* argv[])
   printf("Public key length : %d\n", (int)strlen(pub_key));
 
   create_new_cert("Alexander Wachter", &cert_ptr);
-  sign_mycert(cert_ptr, priv_key);
+  sign_mycert_hex(cert_ptr, priv_key);
   print_mycert(cert_ptr);
   verify_res = verify_mycert(cert_ptr, pub_key);
   printf("Certificate verification result: %s\n", verify_res ? "SUCCESS" : "FAIL");
@@ -55,6 +58,7 @@ int main(int argc, char* argv[])
 
   return EXIT_SUCCESS;
 }
+
 
 int create_new_cert(const char* owner, myCert** cert)
 {
@@ -85,7 +89,7 @@ void print_mycert(myCert* cert)
          cert->owner, cert->pub_key, cert->priv_key ? cert->priv_key : "Not set", cert->signature);
 }
 
-int sign_mycert(myCert* cert, char* sign_priv_key)
+int sign_mycert_hex(myCert* cert, char* sign_priv_key)
 {
   unsigned char hash[SHA256_DIGEST_LENGTH];
   unsigned char *hash_ptr = hash;
@@ -93,8 +97,29 @@ int sign_mycert(myCert* cert, char* sign_priv_key)
 
   if(!hash_mycert(cert, &hash_ptr))
     return 0;
-  if(!sign(hash, sign_priv_key, &signature))
+  if(!sign_hex(hash, sign_priv_key, &signature))
     return 0;
+  return 1;
+}
+
+int sign_mycert_file(myCert* cert, char* file_name)
+{
+  unsigned char hash[SHA256_DIGEST_LENGTH];
+  unsigned char *hash_ptr = hash;
+  int ret = 0, key_size;
+  ECDSA_SIG* sig;
+  
+  char* signature = cert->signature;
+  BIGNUM *priv = NULL;
+
+  //TODO: read from .pem
+
+  if(!hash_mycert(cert, &hash_ptr))
+    return ret;
+  if(!(key_size = sign(hash, priv, &sig)))
+    return ret;
+  ret = sig_to_hex(sig, key_size, &signature);
+  free(sig);
   return 1;
 }
 
@@ -269,18 +294,70 @@ ecc_ver_error:
   return ret;
 }
 
-int sign(unsigned char* hash, char* priv_hex, char** sig_hex)
+int sig_to_hex(ECDSA_SIG* sig, int key_size, char** sig_hex)
+{
+  unsigned char* der = NULL;
+  int ret = 0, der_len = 0;
+
+   if(NULL == (der = malloc(key_size * sizeof(char))))
+  {
+    printf("Failed to malloc der");
+    return 0;
+  }
+  unsigned char* der_copy = (unsigned char*)der;
+  if(!(der_len = i2d_ECDSA_SIG(sig, &der_copy)))
+  {
+    printf("Failed to DER encode the signature\n");
+    goto ecc_sig_hex_error;
+  }
+  if(!bytes_to_hex(der, der_len, sig_hex))
+  {
+    printf("Failed to generate signature string\n");
+    goto ecc_sig_hex_error;
+  }
+  ret = 1;
+ecc_sig_hex_error:
+  free(der);
+  return ret;
+}
+
+int sign_hex(unsigned char* hash, char* priv_hex, char** sig_hex)
+{
+  BIGNUM *priv       = NULL;
+  ECDSA_SIG *sig     = NULL;
+  int key_size;
+  unsigned long err;
+  int ret = 0;
+
+  if (!BN_hex2bn(&priv, priv_hex))
+  {
+    printf("Failed to read private key hex\n");
+    goto ecc_sig_hex_error;
+  }
+  if(!(key_size = sign(hash, priv, &sig)))
+  {
+    printf("signation failed\n");
+    goto ecc_sig_hex_error;
+  }
+  ret = sig_to_hex(sig, key_size, sig_hex);
+
+ecc_sig_hex_error:
+  if((err = ERR_get_error()))
+    printf("SSL ERROR: %s\n",ERR_error_string(err, NULL));
+  BN_free(priv);
+  free(sig);
+  return ret;
+}
+
+int sign(unsigned char* hash, BIGNUM *priv, ECDSA_SIG** signature)
 {
   EC_KEY   *eckey    = NULL;
   EC_GROUP *ecgroup  = NULL;
   EC_POINT* pub      = NULL;
-  BIGNUM *priv       = NULL;
   BN_CTX *bnctx      = NULL;
   ECDSA_SIG *sig     = NULL;
-  unsigned char* der = NULL;
-  int der_len;
   unsigned long err;
-  int ret = 0;
+  int ret = 0, key_size;
 
   if (NULL == (bnctx = BN_CTX_new()))
   {
@@ -307,11 +384,6 @@ int sign(unsigned char* hash, char* priv_hex, char** sig_hex)
     printf("Failed to create public key\n");
     goto ecc_sig_error;
   }
-  if (!BN_hex2bn(&priv, priv_hex))
-  {
-    printf("Failed to read private key hex\n");
-    goto ecc_sig_error;
-  }
   if(1 != EC_KEY_set_private_key(eckey, priv))
   {
     printf("Failed to set private key\n");
@@ -327,27 +399,18 @@ int sign(unsigned char* hash, char* priv_hex, char** sig_hex)
     printf("Failed to set private key\n");
     goto ecc_sig_error;
   }
+  key_size = ECDSA_size(eckey);
   if (NULL == (sig = ECDSA_do_sign(hash, strlen((char*)hash), eckey)))
   {
     printf("Failed to sign\n");
     goto ecc_sig_error;
   }
-  if(NULL == (der = malloc(ECDSA_size(eckey) * sizeof(char))))
-  {
-    printf("Failed to malloc der");
-    goto ecc_sig_error;
-  }
-  unsigned char* der_copy = (unsigned char*)der;
-  if(!(der_len = i2d_ECDSA_SIG(sig, &der_copy)))
-  {
-    printf("Failed to DER encode the signature\n");
-    goto ecc_sig_error;
-  }
-  if(!bytes_to_hex(der, der_len, sig_hex))
-  {
-    printf("Failed to generate signature string\n");
-    goto ecc_sig_error;
-  }
+  *signature = sig;
+  BN_CTX_free(bnctx);
+  EC_GROUP_free(ecgroup);
+  EC_KEY_free(eckey);
+  EC_POINT_free(pub);
+  return key_size;
 
 ecc_sig_error:
   if((err = ERR_get_error()))
@@ -356,9 +419,7 @@ ecc_sig_error:
   EC_GROUP_free(ecgroup);
   EC_KEY_free(eckey);
   EC_POINT_free(pub);
-  BN_free(priv);
   free(sig);
-  free(der);
   return ret;
 }
 
