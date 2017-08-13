@@ -2,10 +2,12 @@
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
 #include <openssl/sha.h>
+#include <openssl/pem.h>
 #include <openssl/err.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <stdio.h>
+#include <unistd.h>
 
 #define curve_name NID_secp224r1
 
@@ -16,11 +18,12 @@ typedef struct _myCert_ {
   char  signature[128 + 1];
 } myCert;
 
-int create_keys(char** pub_hex, char** priv_hex);
+int create_keys_hex(char** pub_hex, char** priv_hex);
+int create_key(EC_KEY **eckey);
 int bytes_to_hex(unsigned char* bytes, int der_len, char** hex_str);
 int hex_to_bytes(char* hex, unsigned char** bytes);
 int verify_signature(unsigned char* hash, char* signature, char* pub_key);
-int sign(unsigned char* hash, BIGNUM *priv, ECDSA_SIG** signature);
+int sign(unsigned char* hash, const BIGNUM *priv, ECDSA_SIG** signature);
 int sign_hex(unsigned char* hash, char* priv_hex, char** sig_hex);
 int sig_to_hex(ECDSA_SIG* sig, int key_size, char** sig_hex);
 int hash_mycert(myCert* cert, unsigned char** hash);
@@ -29,14 +32,79 @@ int sign_mycert_file(myCert* cert, char* private_key);
 int verify_mycert(myCert* cert, char* pub_key);
 int create_new_cert(const char* owner, myCert** cert);
 void print_mycert(myCert* cert);
+int generate_key_file(char* filename, char enc, unsigned char* password);
 
 int main(int argc, char* argv[])
 {
-  char *sig = NULL, *pub_key = NULL, *priv_key = NULL;
-  int verify_res;
-  myCert cert;
-  myCert *cert_ptr = &cert;
+  //char *sig = NULL, *pub_key = NULL, *priv_key = NULL;
+  //int verify_res;
+  //myCert cert;
+  //myCert *cert_ptr = &cert;
+  char* filename = NULL;
+  char* owner    = NULL;
+  unsigned char* password = NULL;
+  char create_pem = 0;
+  char create_cert = 0;
+  char encrypt = 0;
+  int c;
 
+  while ((c = getopt (argc, argv, "f:o:p:ecs")) != -1)
+    switch (c)
+      {
+      case 'o':
+        owner = optarg;
+        break;
+      case 'f':
+        filename = optarg;
+        break;
+      case 'p':
+        password = (unsigned char*)optarg;
+        break;
+      case 'c':
+        create_cert = 1;
+        break;
+      case 's':
+        create_pem = 1;
+        break;
+      case 'e':
+        encrypt = 1;
+        break;
+      case '?':
+        if (optopt == 'f' || optopt == 'o' || optopt == 'p')
+          fprintf (stderr, "Option -%c requires an argument.\n", optopt);
+        else
+          fprintf (stderr,
+                   "Unknown option character `\\x%x'.\n",
+                   optopt);
+        return 1;
+      default:
+        abort ();
+      }
+
+  if(create_pem)
+  {
+    if(!filename)
+    {
+      printf("filename is missing\n");
+      return EXIT_FAILURE;
+    }
+    generate_key_file(filename, encrypt, password);
+  }
+  if(create_cert)
+  {
+    myCert cert;
+    myCert *cert_ptr = &cert;
+    if(!filename || !owner)
+    {
+      printf("Filename or owner is missing\n");
+      return EXIT_FAILURE;
+    }
+    create_new_cert(owner, &cert_ptr);
+    sign_mycert_file(cert_ptr, filename);
+    print_mycert(cert_ptr);
+  }
+  
+  /*
   create_keys(&pub_key, &priv_key);
   printf("Public key : %s\nPrivate key: %s\n", pub_key, priv_key);
   sign_hex((unsigned char*)"this is the second hash", priv_key, &sig);
@@ -54,11 +122,42 @@ int main(int argc, char* argv[])
   printf("Certificate verification result: %s\n", verify_res ? "SUCCESS" : "FAIL");
   free(pub_key);
   free(priv_key);
-  free(cert.priv_key);
+  free(cert.priv_key);*/
 
   return EXIT_SUCCESS;
 }
 
+int generate_key_file(char* filename, char enc, unsigned char* password)
+{
+  FILE* pem_file;
+  EC_KEY *eckey = NULL;
+  char* pub_hex = NULL;
+  BN_CTX *bnctx = NULL;
+
+  if (NULL == (bnctx = BN_CTX_new()))
+  {
+    printf("Failed to generate bignum context\n");
+    return 0;
+  }
+  if(!(pem_file = fopen(filename, "w")))
+  {
+    printf("Failed to create file %s\n", filename);
+    return 0;
+  }
+  create_key(&eckey);
+  PEM_write_ECPrivateKey(pem_file, eckey, enc ? EVP_aes_256_cbc() : NULL,
+                         password, password ? strlen((char*)password) : 0, NULL, NULL);
+
+  pub_hex = EC_POINT_point2hex(EC_KEY_get0_group(eckey), EC_KEY_get0_public_key(eckey),
+                               POINT_CONVERSION_UNCOMPRESSED, bnctx);
+  printf("Pubkey: %s\n", pub_hex);
+
+  free(pub_hex);
+  fclose(pem_file);
+  EC_KEY_free(eckey);
+  BN_CTX_free(bnctx);
+  return 1;
+}
 
 int create_new_cert(const char* owner, myCert** cert)
 {
@@ -75,7 +174,7 @@ int create_new_cert(const char* owner, myCert** cert)
   cert_ = *cert;
 
   cert_->owner = owner;
-  if(!create_keys(&pub_key, &priv_key))
+  if(!create_keys_hex(&pub_key, &priv_key))
     return 0;
   strcpy(cert_->pub_key, pub_key);
   cert_->priv_key = priv_key;
@@ -108,17 +207,26 @@ int sign_mycert_file(myCert* cert, char* file_name)
   unsigned char *hash_ptr = hash;
   int ret = 0, key_size;
   ECDSA_SIG* sig;
-  
+  FILE* pem_file;
   char* signature = cert->signature;
-  BIGNUM *priv = NULL;
+  EC_KEY *eckey = NULL;
+  EVP_PKEY *pkey = NULL;
 
-  //TODO: read from .pem
-
+  if(!(pem_file = fopen(file_name, "r")))
+  {
+    printf("Failed to open file %s\n", file_name);
+    return ret;
+  }
+  PEM_read_PrivateKey(pem_file, &pkey, NULL, NULL);
+  eckey = EVP_PKEY_get1_EC_KEY(pkey);
   if(!hash_mycert(cert, &hash_ptr))
     return ret;
-  if(!(key_size = sign(hash, priv, &sig)))
+  if(!(key_size = sign(hash, EC_KEY_get0_private_key(eckey), &sig)))
     return ret;
   ret = sig_to_hex(sig, key_size, &signature);
+  
+  fclose(pem_file);
+  EVP_PKEY_free(pkey);
   free(sig);
   return 1;
 }
@@ -349,7 +457,7 @@ ecc_sig_hex_error:
   return ret;
 }
 
-int sign(unsigned char* hash, BIGNUM *priv, ECDSA_SIG** signature)
+int sign(unsigned char* hash, const BIGNUM *priv, ECDSA_SIG** signature)
 {
   EC_KEY   *eckey    = NULL;
   EC_GROUP *ecgroup  = NULL;
@@ -423,7 +531,51 @@ ecc_sig_error:
   return ret;
 }
 
-int create_keys(char** pub_hex, char** priv_hex)
+int create_key(EC_KEY **eckey)
+{
+  EC_KEY* new_key;
+  EC_GROUP *ecgroup    = NULL;
+  unsigned long err;
+
+  new_key = *eckey;
+  if(NULL == new_key)
+  {
+    if (NULL == (new_key = EC_KEY_new()))
+    {
+      printf("Failed to create new EC Key\n");
+      goto ecc_sign_error;
+    }
+    *eckey = new_key;
+  }
+
+  if (NULL == (ecgroup = EC_GROUP_new_by_curve_name(curve_name)))
+  {
+    printf("Failed to create new EC Group\n");
+    goto ecc_sign_error;
+  }
+  if (1 != EC_KEY_set_group(new_key,ecgroup))
+  {
+    printf("Failed to set group for EC Key\n");
+    goto ecc_sign_error;
+  }
+  if(1 != EC_KEY_generate_key(new_key))
+  {
+    printf("Error creating key\n");
+    goto ecc_sign_error;
+  }
+
+  EC_GROUP_free(ecgroup);
+  return 1;
+
+ecc_sign_error:
+  if((err = ERR_get_error()))
+    printf("SSL ERROR: %s\n",ERR_error_string(err, NULL));
+  EC_GROUP_free(ecgroup);
+  EC_KEY_free(new_key);
+  return 0;
+}
+
+int create_keys_hex(char** pub_hex, char** priv_hex)
 {
   EC_KEY   *eckey      = NULL;
   EC_GROUP *ecgroup    = NULL;
@@ -434,22 +586,7 @@ int create_keys(char** pub_hex, char** priv_hex)
   char* priv_str       = NULL;
   unsigned long err;
 
-  if (NULL == (eckey = EC_KEY_new()))
-  {
-    printf("Failed to create new EC Key\n");
-    goto ecc_sign_error;
-  }
-  if (NULL == (ecgroup = EC_GROUP_new_by_curve_name(curve_name)))
-  {
-    printf("Failed to create new EC Group\n");
-    goto ecc_sign_error;
-  }
-  if (1 != EC_KEY_set_group(eckey,ecgroup))
-  {
-    printf("Failed to set group for EC Key\n");
-    goto ecc_sign_error;
-  }
-  if(1 != EC_KEY_generate_key(eckey))
+  if(1 != create_key(&eckey))
   {
     printf("Error creating key\n");
     goto ecc_sign_error;
