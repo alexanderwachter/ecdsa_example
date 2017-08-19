@@ -182,17 +182,25 @@ int get_pubic_key(char* filename, unsigned char* password)
   const BIGNUM* priv;
   BN_CTX *bnctx = NULL;
   char* pub_hex = NULL;
+  unsigned long err;
   int ret = 0;
+
+  OpenSSL_add_all_algorithms();
 
   if(!(pem_file = fopen(filename, "r")))
   {
     printf("Failed to open file %s\n", filename);
     return 0;
   }
-  if(!PEM_read_ECPrivateKey(pem_file, &eckey, NULL, password) || !eckey)
+  if (NULL == (eckey = EC_KEY_new()))
+  {
+    printf("Failed to create new EC Key\n");
+    goto ecc_get_pub_error;
+  }
+  if(NULL == (PEM_read_ECPrivateKey(pem_file, &eckey, NULL, password)))
   {
     printf("Failed to read public key from file %s\n", filename);
-    return 0;
+    goto ecc_get_pub_error;
   }
   if (NULL == (bnctx = BN_CTX_new()))
   {
@@ -227,6 +235,8 @@ int get_pubic_key(char* filename, unsigned char* password)
   ret = 1;
 
 ecc_get_pub_error:
+  if((err = ERR_get_error()))
+    printf("SSL ERROR: %s\n",ERR_error_string(err, NULL));
   fclose(pem_file);
   free(pub_hex);
   EC_POINT_free(pub);
