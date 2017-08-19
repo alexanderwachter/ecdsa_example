@@ -33,6 +33,7 @@ int verify_mycert(myCert* cert, char* pub_key);
 int create_new_cert(const char* owner, myCert** cert);
 void print_mycert(myCert* cert);
 int generate_key_file(char* filename, char enc, unsigned char* password);
+int get_pubic_key(char* filename, unsigned char* password);
 
 int main(int argc, char* argv[])
 {
@@ -46,9 +47,10 @@ int main(int argc, char* argv[])
   char create_pem = 0;
   char create_cert = 0;
   char encrypt = 0;
+  char print_pubic_key = 0;
   int c;
 
-  while ((c = getopt (argc, argv, "f:o:p:ecs")) != -1)
+  while ((c = getopt (argc, argv, "f:o:p:ecsr")) != -1)
     switch (c)
       {
       case 'o':
@@ -65,6 +67,9 @@ int main(int argc, char* argv[])
         break;
       case 's':
         create_pem = 1;
+        break;
+      case 'r':
+        print_pubic_key = 1;
         break;
       case 'e':
         encrypt = 1;
@@ -103,7 +108,16 @@ int main(int argc, char* argv[])
     sign_mycert_file(cert_ptr, filename);
     print_mycert(cert_ptr);
   }
-  
+  if(print_pubic_key)
+  {
+    if(!filename)
+    {
+      printf("filename is missing\n");
+      return EXIT_FAILURE;
+    }
+    get_pubic_key(filename, password);
+  }
+
   /*
   create_keys(&pub_key, &priv_key);
   printf("Public key : %s\nPrivate key: %s\n", pub_key, priv_key);
@@ -158,6 +172,69 @@ int generate_key_file(char* filename, char enc, unsigned char* password)
   BN_CTX_free(bnctx);
   return 1;
 }
+
+int get_pubic_key(char* filename, unsigned char* password)
+{
+  FILE* pem_file;
+  EC_KEY *eckey = NULL;
+  const EC_GROUP *ecgroup;
+  EC_POINT* pub = NULL;
+  const BIGNUM* priv;
+  BN_CTX *bnctx = NULL;
+  char* pub_hex = NULL;
+  int ret = 0;
+
+  if(!(pem_file = fopen(filename, "r")))
+  {
+    printf("Failed to open file %s\n", filename);
+    return 0;
+  }
+  if(!PEM_read_ECPrivateKey(pem_file, &eckey, NULL, password) || !eckey)
+  {
+    printf("Failed to read public key from file %s\n", filename);
+    return 0;
+  }
+  if (NULL == (bnctx = BN_CTX_new()))
+  {
+    printf("Failed to generate bignum context\n");
+    goto ecc_get_pub_error;
+  }
+
+  ecgroup = EC_KEY_get0_group(eckey);
+  priv = EC_KEY_get0_private_key(eckey);
+
+  if(NULL == (pub = EC_POINT_new(ecgroup)))
+  {
+    printf("Failed to create public key\n");
+    goto ecc_get_pub_error;
+  }
+  if(!ecgroup || !priv)
+  {
+    printf("Failed to read group or private key\n");
+    goto ecc_get_pub_error;
+  }
+  if(!EC_POINT_mul(ecgroup, pub, priv, NULL, NULL, bnctx))
+  {
+    printf("Failed to derive private key\n");
+    goto ecc_get_pub_error;
+  }
+
+  if(!(pub_hex = EC_POINT_point2hex(ecgroup, pub, POINT_CONVERSION_UNCOMPRESSED, bnctx)))
+  {
+    printf("Failed to convert EC_POINT to hex\n");
+  }
+  printf("Pubkey: %s\n", pub_hex);
+  ret = 1;
+
+ecc_get_pub_error:
+  fclose(pem_file);
+  free(pub_hex);
+  EC_POINT_free(pub);
+  EC_KEY_free(eckey);
+  BN_CTX_free(bnctx);
+  return ret;
+}
+
 
 int create_new_cert(const char* owner, myCert** cert)
 {
